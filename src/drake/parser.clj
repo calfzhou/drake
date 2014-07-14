@@ -85,16 +85,6 @@
 (def default-base "")
 
 ;;
-;; Helper functions
-;;
-
-(defn ensure-ends-with-newline
-  [s]
-  (if (.endsWith s "\n") 
-    s 
-    (str s "\n")))
-
-;;
 ;; Drake-specific grammar rules
 ;;
 
@@ -174,7 +164,7 @@
   (let [cmd-out (java.io.StringWriter.)
         new-options (concat options [:out [cmd-out]])]
     (apply shell new-options)
-    (.toString cmd-out)))
+    (str cmd-out)))
 
 (def shell-memo (memo/memo shell-helper))
 
@@ -192,14 +182,14 @@
    [_ dollar-sign
     _ open-paren
     prod (p/semantics
-          (p/rep+ (p/alt single-quote-shell-string 
+          (p/rep+ (p/alt single-quote-shell-string
                          double-quote-shell-string
                          (var-sub true true)
                          (p/except string-char close-paren)))
           apply-str)
     _ (p/failpoint close-paren
                    (illegal-syntax-error-fn "command substitution"))
-    line (p/get-info :line) 
+    line (p/get-info :line)
     column (p/get-info :column)]
 
     ;; stderr preserved by default
@@ -210,7 +200,11 @@
 
 (defn string-substitution
   [chars]
-  (p/semantics (p/rep+ (p/alt (var-sub true true) command-sub chars))
+  (p/semantics (p/rep+ (p/alt (var-sub true true)
+                              strong-quote
+                              escape-sequence
+                              command-sub
+                              chars))
                apply-str))
 
 (def option-true-bool
@@ -312,7 +306,7 @@
     (clip file)
     (str prefix file)))
 
-(defn add-path-sep-suffix [path]
+(defn add-path-sep-suffix [^String path]
   (if (or (empty? path)
           (.endsWith path "/")
           (.endsWith path ":"))
@@ -340,12 +334,11 @@
        'INPUT2' 'tim.yaml'
      }"
   [items prefix]
-  (reduce
-   #(assoc %1 (str prefix (first %2)) (second %2))
-   {prefix (first items)
-    (str prefix "S") (s/join " " items)
-    (str prefix "N") (count items)}
-   (keep-indexed vector items)))
+  (into {prefix (first items),
+         (str prefix "S") (s/join " " items),
+         (str prefix "N") (count items)}
+        (for [[i v] (map-indexed vector items)]
+          [(str prefix i) v])))
 
 ;; TODO(artem)
 ;; Should we move this to a common library?
@@ -461,8 +454,11 @@
 
     ;; generate vars from step-def-line, so that commands can refer to them
     _ (p/update-info :vars #(merge % (:vars step-def-product)))
-    commands (p/failpoint (p/rep* (command-line true))
-                          (illegal-syntax-error-fn "step"))
+
+    ;; make sure that non-indented blank lines don't terminate the command list
+    commands (p/rep* (p/alt (p/constant-semantics line-break :empty)
+                            (command-line true)))
+    :let [commands (remove #{:empty} commands)]
 
     ;; auto generated vars only persist during the step; unwind var scope
     _ (p/set-info :vars orig-vars)
@@ -470,8 +466,7 @@
    (let [step-prod (merge
                     step-def-product
                     (deep-merge commands))
-         method (get-in step-def-product [:opts :method])
-         method-mode (get-in step-def-product [:opts :method-mode])]
+         {:keys [method method-mode template]} (:opts step-def-product)]
      (cond
       (not (or (empty? method) (methods method)))
       (throw-parse-error state (format "method '%s' undefined at this point."
@@ -495,7 +490,7 @@
                               "(use method-mode:append or method-mode:replace "
                               "to allow)") nil)
 
-      (= true (get-in step-def-product [:opts :template]))
+      template
       {:templates [step-prod]}
 
       :else
@@ -585,19 +580,19 @@
      line (p/get-info :line)]
 
     (parse-state
-      (struct state-s
-              (ensure-ends-with-newline tokens)
-              vars 
-              methods 
-              0 
-              line)))) ; try to preserve line number as best we can 
+      (make-state
+              (ensure-final-newline tokens)
+              vars
+              methods
+              0
+              line)))) ; try to preserve line number as best we can
 
 (def inline-shell-cmd-line
   "input: shell command on its own line, e.g.
   $(echo '%include dude.d')
   The output of the shell command will be placed inline the workflow file.
   This can be recursive, i.e. shell commands can print more shell commands.
-  
+
   Split into two parts for much the same reason as call-or-include-line is."
   (p/complex
    [prod inline-shell-helper
@@ -623,10 +618,10 @@
    (let [raw-base (get vars "BASE" default-base)
          base (add-path-sep-suffix raw-base)
          ;; Need to use fs/file here to honor cwd
-         tokens (slurp (fs/file file-path))
+         ^String tokens (slurp (fs/file file-path))
          prod (parse-state
-               (assoc (struct state-s
-                        (if (.endsWith tokens "\n") tokens (str tokens "\n"))
+               (assoc (make-state
+                        (ensure-final-newline tokens)
                         vars methods 0 0)
                  :file-path file-path))]
      (if (= directive "include")
@@ -658,22 +653,24 @@
 ;; The functions below uses the rules to parse workflows.
 
 (defn parse-state  [state]
-  (->
-   (p/rule-match workflow
-                 #((illegal-syntax-error-fn "start of workflow")
-                   (:remainder %2) %2) ;; fail
-                 #((illegal-syntax-error-fn "workflow")
-                   (:remainder %2) %2) ;; incomplete match
-                 state)
-   add-dependencies
-   calc-step-dirs))
+  (with-redefs [p/*remainder-accessor* remainder-accessor
+                p/*remainder-setter* remainder-setter]
+    (->
+     (p/rule-match workflow
+                   #((illegal-syntax-error-fn "start of workflow")
+                     (:remainder %2) %2) ;; fail
+                   #((illegal-syntax-error-fn "workflow")
+                     (:remainder %2) %2) ;; incomplete match
+                   state)
+     add-dependencies
+     calc-step-dirs)))
 
-(defn parse-str [tokens vars]
+(defn parse-str [^String tokens vars]
   (trace "Parsing started...")
   (with-time-elapsed
     (in-ms debug "Parsing")
-    (parse-state (struct state-s
-                         (if (.endsWith tokens "\n") tokens (str tokens "\n"))
+    (parse-state (make-state
+                         (ensure-final-newline tokens)
                          (merge {"BASE" default-base} vars)
                          #{}
                          1 1))))

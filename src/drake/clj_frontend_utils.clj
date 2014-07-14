@@ -2,8 +2,7 @@
   (:require [clojure.string :as str]
             [drake.parser :as parse]
             [drake.parser_utils :refer [illegal-syntax-error-fn
-                                        throw-parse-error
-                                        state-s]]
+                                        throw-parse-error make-state]]
             [drake.steps :as d-steps]
             [drake.utils :as d-utils]
             [drake.options :refer [*options*]]
@@ -129,8 +128,7 @@
   invalid method-mode, method-mode is set without method, commands
   with method-mode set to \"use\""
   [parse-tree step-map]
-  (let [step-method (get-in step-map [:opts :method])
-        method-mode (get-in step-map [:opts :method-mode])
+  (let [{step-method :method, :keys [method-mode]} (:opts step-map)
         methods (set (keys (:methods parse-tree)))
         commands (:cmds step-map)
         state nil]
@@ -180,18 +178,11 @@
 
 ;; Below here are functions for testing
 
-(defn ensure-final-newline
-  "Make a the string ends with a newline"
-  [s]
-  (if (.endsWith s "\n")
-    s
-    (str s "\n")))
-
 (defn str->parse-tree
   "Take a string s and makes a raw parse-tree."
   [s]
-  (let [state (struct state-s
-                      (ensure-final-newline s)
+  (let [state (make-state
+                      (d-utils/ensure-final-newline s)
                       {}
                       #{}
                       1 1)]
@@ -254,7 +245,7 @@
                             (pprint (:step event-map))))
       :step-end       (println (step-string event-map)
                                "Step Finished @" (event-time event-map))
-      :step-error     (do (println "\nEnconterred an Error:")
+      :step-error     (do (println "\nEncountered an Error:")
                           (pprint event-map)))))
 
 

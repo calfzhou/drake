@@ -6,6 +6,8 @@
             [clojure.core.memoize :as memo]
             [clj-logging-config.log4j :as log4j]
             [fs.core :as fs]
+            [clojopts.ui :as clojopts]
+            [flatland.useful.state :as state]
             ;; register built-in protocols
             drake.protocol_interpreters
             drake.protocol_c4
@@ -31,7 +33,16 @@
 
 (def VERSION "0.1.6")
 (def PLUGINS-FILE "plugins.edn")
-(def DEFAULT-VARS-SPLIT-REGEX-STR ",(?=([^\"]*\"[^\"]*\")*[^\"]*$)")
+(def DEFAULT-VARS-SPLIT-REGEX-STR ; matches and consumes a comma; requires that an even number of "
+                                  ; characters exist between the comma and end of string
+  "(?x)       ## (?x) enables inline formatting and comments
+  ,           ## a comma
+  (?=         ## as long as what comes next is
+    ([^\"]*   ## any number of characters other than \"
+    \"        ## then a \"
+    [^\"]*\"  ## and more non-\"s followed by a \"
+  )*          ## all this any number of times
+  [^\"]*$)    ## and finally a bunch of non-quotes before end of string")
 
 (def DEFAULT-OPTIONS {:workflow "./Drakefile"
                       :logfile "drake.log"
@@ -47,11 +58,10 @@
 (defn- step-string
   "Returns step's symbolic representation for printing."
   [step]
-  (str (str/join ", " (concat (map #(str "%" %) (step :output-tags))
-                              (step :outputs)))
-       " <- "
-       (str/join ", " (concat (map #(str "%" %) (step :input-tags))
-                              (step :inputs)))))
+  (str/join " <- "
+            (for [[tags files] [[:output-tags :outputs] [:input-tags :inputs]]]
+              (str/join ", " (concat (map (partial str "%") (step tags))
+                                     (step files))))))
 
 (defn- user-confirms?
   "Returns true if the user enters 'Y', otherwise returns false."
@@ -73,7 +83,7 @@
      - adding #branch suffixes only to those inputs that do exist in this branch,
        unless add-to-all is true"
   [{:keys [inputs outputs] :as step} add-to-all]
-  (let [branch (*options* :branch)
+  (let [branch (:branch *options*)
         branch-adjusted-outputs (if (empty? branch)
                                   outputs
                                   (map #(str % "#" branch) outputs))
@@ -111,7 +121,10 @@
   [cmds]
   (let [prefix (apply str (take-while #{\space \tab} (first cmds)))
         prefix-len (count prefix)]
-    (map #(if (.startsWith %1 prefix) (.substring %1 prefix-len) %1) cmds)))
+    (for [^String cmd cmds]
+      (if (.startsWith cmd prefix)
+        (.substring cmd prefix-len)
+        cmd))))
 
 (defn- prepare-step-for-run
   "Given a step, prepares its inputs and outputs for running by:
@@ -129,14 +142,14 @@
         vars (merge vars
                     (inouts-map normalized-inputs "INPUT")
                     (inouts-map normalized-outputs "OUTPUT"))
-        method (methods (opts :method))
-        method-mode (opts :method-mode)
+        method (methods (:method opts))
+        method-mode (:method-mode opts)
         cmds (if (or (not method) (= method-mode "replace"))
                cmds
                (if (= method-mode "append")
-                 (concat (method :cmds) cmds)
-                 (method :cmds)))
-        vars (if-not method vars (merge (method :vars) vars))
+                 (concat (:cmds method) cmds)
+                 (:cmds method)))
+        vars (if-not method vars (merge (:vars method) vars))
         substitute-var #(if-not (set? %)
                          %
                          (let [var-name (first %)]
@@ -147,7 +160,7 @@
                                      "variable \"%s\" undefined at this point."
                                      var-name)}))))
         cmds (despace-cmds (map #(apply str (map substitute-var %)) cmds))]
-    (if (and (empty? cmds) (.cmds-required? (get-protocol step)))
+    (if (and (empty? cmds) (di/cmds-required? (get-protocol step)))
       (throw+ {:msg
                (format "protocol '%s' requires non-empty commands, for step: %s "
                        (get-protocol-name step)
@@ -157,7 +170,7 @@
       :outputs normalized-outputs
       :cmds cmds
       :vars vars
-      :opts (if-not method opts (merge (method :opts) opts)))))
+      :opts (if-not method opts (merge (:opts method) opts)))))
 
 (defn- should-build?
   "Given the parse tree and a step index, determines whether it should
@@ -233,7 +246,7 @@
   (first
    (reduce (fn [[new-target-steps triggered-deps]
                 {:keys [index build match-type] :as step}]
-             (let [step-map ((parse-tree :steps) index)
+             (let [step-map (get-in parse-tree [:steps index])
                    cause (should-build? step-map (= build :forced)
                                         (triggered-deps index) match-type false)]
                (trace (format "predict-steps, index=%d, cause=%s" index cause))
@@ -251,7 +264,7 @@
   (str "The following steps will be run, in order:\n"
        (str/join "\n"
          (for [[i {:keys [index cause]}]
-               (keep-indexed vector steps-to-run)]
+               (map-indexed vector steps-to-run)]
            ;; TODO(artem)
            ;; Optimize for repeated BASE prefixes (we can't just show it
            ;; without base, since it can be ambiguous)
@@ -265,7 +278,7 @@
            (format "  %d: %s [%s]"
                    (inc i)
                    (step-string (branch-adjust-step
-                                 ((parse-tree :steps) index)
+                                 (get-in parse-tree [:steps index])
                                  (contains? #{"projected timestamped"
                                               "forced"}
                                             cause)))
@@ -282,30 +295,27 @@
   "Estimates the list of steps to be run, asks the user for confirmation,
    returns this new list if confirmed, or nil if rejected."
   [parse-tree steps-to-run]
-  (if (*options* :auto)
+  (if (:auto *options*)
     true
     (do
       (println (steps-report parse-tree steps-to-run))
       (user-confirms?))))
 
 (defn- spit-step-vars [{:keys [vars dir] :as step}]
-  (let [filename (str dir "/vars-" start-time-filename)
+  (let [file (fs/file dir (str "vars-" start-time-filename))
         contents (apply str
                         "Environment vars set by Drake:\n\n"
-                        (map #(str (key %) "=" (val %) "\n") vars))]
-    (if-not (fs/exists? dir)
-      (fs/mkdirs dir))
-    ;; we need to use fs.core/file here, since fs.core/with-cwd only changes the
-    ;; working directory for fs.core namespace
-    (spit (fs/file filename) contents)
-    (debug "step's vars saved to" (relative-path filename))))
+                        (for [[k v] vars]
+                          (str k "=" v)))]
+    (fs/mkdirs dir)
+    (spit file contents)
+    (debug "step's vars saved to" (relative-path file))))
 
 (defn- run-step
   "Runs one step performing all necessary checks, returns
    true if the step was actually run; false if skipped."
   [parse-tree step-number {:keys [index build match-type opts]}]
-  (let [step ((parse-tree :steps) index)
-        inputs (step :inputs)]
+  (let [{:keys [inputs] :as step} (get-in parse-tree [:steps index])]
     ;; TODO(artem)
     ;; Somewhere here, before running the step or checking timestamps, we need to
     ;; check for optional files and replace them with empty strings if they're
@@ -317,8 +327,9 @@
       (throw+ {:msg (str "optional input files are not supported yet: "
                          inputs)}))
     (let [step-descr (step-string (branch-adjust-step step false))
-          step (update-in step [:opts] #(merge % opts))
-          step (prepare-step-for-run step parse-tree)
+          step (-> step
+                   (update-in [:opts] merge opts)
+                   (prepare-step-for-run parse-tree))
           should-build (should-build? step (= build :forced)
                                       false match-type true)]
       (info "")
@@ -337,11 +348,11 @@
                            step-number
                            step-descr
                            (/ % 1000.0)
-                           (if-not (> wait 0)
+                           (if-not (pos? wait)
                              ""
-                             (do (. Thread (sleep wait))
+                             (do (Thread/sleep wait)
                                  (format " + waited %dms" wait))))))
-          (.run (get-protocol step) step)))
+          (di/run (get-protocol step) step)))
       should-build)))
 
 (defn- create-state-atom
@@ -361,61 +372,53 @@
    Block if waiting on dependencies."
   [state-atom]
   (loop []
-    (let [state @state-atom
-          steps (:steps state)
-          not-runnable (:not-runnable state)
-          runnable (:runnable state)]
+    (let [{:keys [runnable not-runnable steps] :as state}
+          (state/wait-until state-atom #(or (seq (:runnable %))
+                                            (empty? (:not-runnable %))))]
       (cond
         ; If there are runnable steps, pop one off and return it
-        (seq runnable) (let [popped-step-index (first runnable)
-                             new-state (assoc state :runnable (disj runnable popped-step-index))]
-                         (if (compare-and-set! state-atom state new-state)
+        (seq runnable) (let [popped-step-index (first runnable)]
+                         (if (compare-and-set! state-atom state
+                                               (update-in state [:runnable] disj popped-step-index))
                            (first (filter #(= (:index %) popped-step-index) steps))
                            (recur))) ; if compare-and-set fails, try the whole thing again
 
-        ; If there are non-runnable steps, wait until one is runnable
-        (seq not-runnable) (do
-                             (Thread/sleep 100) ; NOTE(Myron) spin-wait not ideal
-                             (recur))
+        ; If there are non-runnable steps, go back and wait until one is runnable
+        (seq not-runnable) (recur)
 
         ; Otherwise, there's nothing left
         :else nil))))
 
 (defn- update-state-atom-when-step-finishes
-  "Use this with swap! to update the state atom when a step finishes"
+  "Use this with swap! to update the state atom when a step finishes.
+   It moves all children of this step which were not runnable but have become
+   so (because this step was their last dependency) from :not-runnable to
+   :runnable."
   [state step]
-  (let [i (:index step)
-        state (assoc state :done (conj (:done state) i)) ; put this step on the "done" list
-        done (:done state)
-        not-runnable (:not-runnable state)
-        runnable (:runnable state)
-        children (filter #((:children step) (:index %)) (:steps state))
-        children-not-yet-running (filter #(not-runnable (:index %)) children)
-        runnable-steps (filter (fn [child]
-                                 (every? (fn [dep]
-                                           (done dep))
-                                         (:deps child)))
-                               children-not-yet-running)
-        runnable-step-numbers (map :index runnable-steps)
-        state (assoc state :not-runnable (apply (partial disj not-runnable) runnable-step-numbers)) ]
-    (if (seq runnable-step-numbers)
-      (assoc state :runnable (apply (partial conj runnable) runnable-step-numbers))
-      state)))
+  (let [children (:children step)
+        state (update-in state [:done] conj (:index step)) ; put this step on the "done" list
+        {:keys [done not-runnable steps]} state
+        newly-runnable-step-numbers (for [{:keys [index deps]} steps
+                                          :when (and (children index)
+                                                     (not-runnable index)
+                                                     (every? done deps))]
+                                      index)]
+    (-> (apply update-in state [:not-runnable] disj newly-runnable-step-numbers)
+        (update-in [:runnable] into newly-runnable-step-numbers))))
 
 (defn- lazy-step-list
   "Create a lazy list that pops runnable steps from the state-atom."
   [state-atom]
-  (when-let [step (pop-next-step-from-atom state-atom)]
-    (cons step (lazy-seq (lazy-step-list state-atom)))))
+  (take-while identity (repeatedly #(pop-next-step-from-atom state-atom))))
 
 (defn- add-empty-promises-to-steps
   [steps promise-key]
   (map (fn [step] (assoc step promise-key (promise))) steps))
 
 (defn- assoc-promise
-  "Associates a promise instance for each step
-  a promise of value 1 is delivered on success
-  a promise of value 0 is delirvered on failure"
+  "Associates a promise instance for each step.
+  - a promise of value 1 is delivered on success
+  - a promise of value 0 is delirvered on failure"
   [steps]
   (add-empty-promises-to-steps steps :promise))
 
@@ -423,35 +426,26 @@
   "Associates dependencies as set object containing the indexes for each step"
   [parse-tree steps]
   (let [indexes (into #{} (map :index steps))]
-    (map (fn [step]
-           (assoc step
-                  :deps
-                  (->>
-                    (expand-step-restricted parse-tree (:index step) nil indexes)
-                    (into #{}) ; turn into set to remove duplicates
-                    ; do not mark the step itself as its dependency
-                    (filter (partial not= (:index step))))))
-         steps)))
+    (for [{:keys [index] :as step} steps]
+      (assoc step :deps
+             (-> (expand-step-restricted parse-tree index nil indexes)
+                 (set)             ; turn into set to remove duplicates
+                 (disj index)))))) ; do not mark the step itself as its dependency
 
 (defn- assoc-parents-and-children
   [parse-tree steps]
-  (let [indexes (into #{} (map :index steps))]
-    (map #(let [tree-step ((:steps parse-tree) (:index %))
-                children (intersection (:children tree-step) indexes)
-                parentals (intersection (:parents tree-step) indexes)
-                opts (:opts tree-step)
-                input-tags (:input-tags tree-step)
-                output-tags (:output-tags tree-step)
-                id (:id tree-step)]
-            (assoc %
-                   :name (step-string tree-step)
-                   :children (or children #{})
-                   :parents (or parentals #{})
-                   :opts opts
-                   :input-tags input-tags
-                   :output-tags output-tags
-                   :id id))
-         steps)))
+  (let [indexes (into #{} (map :index steps))
+        tree-steps (:steps parse-tree)]
+    (for [step steps]
+      (let [tree-step (tree-steps (:index step))
+            children (intersection (:children tree-step) indexes)
+            parentals (intersection (:parents tree-step) indexes)]
+        (into (assoc step
+                :name (step-string tree-step)
+                :children (or children #{})
+                :parents (or parentals #{}))
+              (for [k [:opts :input-tags :output-tags :id]]
+                [k (get tree-step k)]))))))
 
 (defn- assoc-no-stdin-opt
   "Set :no-stdin option for all steps if jobs > 1"
@@ -467,18 +461,17 @@
 
 (defn- attempt-run-step
   [parse-tree step]
-  (let [prom (:promise step)]
+  (let [{:keys [index promise exception-promise]} step]
     (try
       ; run the step (the actual job)
-      (run-step parse-tree (:index step) step)
-      (deliver prom 1) ; delivers a promise of 1/success
+      (run-step parse-tree index step)
+      (deliver promise 1) ; delivers a promise of 1/success
       (catch Exception e
-        (error (str "caught exception step " (:index step) ": ") (.getMessage e) (.printStackTrace e))
         (deliver (:exception-promise step) e))
       (finally
         ; if promise not delivered, deliver a promise of 0/failure
-        (when (not (realized? prom))
-          (deliver prom 0))))))
+        (when (not (realized? promise))
+          (deliver promise 0))))))
 
 (defn- function-for-step
   "Returns an anonymous function that can be triggered in its own thread to execute a step.
@@ -487,21 +480,20 @@
   (fn []
     ; wait for parent promises in the tree promises to be delivered
     ; accumulate successful parent tasks into a sum : successful-parent-steps
-    (let [prom (:promise step)]
+    (let [{:keys [promise deps exception-promise]} step]
       (try
-        (let [deps (:deps step)
-              successful-parent-steps (reduce +
+        (let [successful-parent-steps (reduce +
                                               (map (fn [i]
                                                      @(promises-indexed i))
                                                    deps))]
           (if (= successful-parent-steps (count deps))
             (attempt-run-step parse-tree step)
-            (deliver prom 0)))
+            (deliver promise 0)))
         (catch Exception e
-          (deliver (:exception-promise step) e))
+          (deliver exception-promise e))
         (finally
-          (when (not (realized? prom))
-            (deliver prom 0)))))))
+          (when (not (realized? promise))
+            (deliver promise 0)))))))
 
 (defn- assoc-function
   "Associates a future (anonymous function) for each step"
@@ -516,7 +508,7 @@
          steps)))
 
 (defn- post
-  [event-bus event]
+  [^com.google.common.eventbus.EventBus event-bus event]
   (when event-bus (.post event-bus event)))
 
 (defn- sanitize-step
@@ -606,23 +598,20 @@
 (defn print-steps
   "Prints inputs and outputs of steps to run."
   [parse-tree steps-to-run]
-  (dorun (map
-          (fn [step]
-            (do
-              (println "S")
-              (doseq [[prefix key] [["I" :inputs]
-                                    ["%I" :input-tags]
-                                    ["O" :outputs]
-                                    ["%O" :output-tags]]]
-                (dorun (map #(println (str prefix \tab %)) (step key))))))
-          (map (:steps parse-tree) (map :index steps-to-run)))))
+  (doseq [step (map (:steps parse-tree) (map :index steps-to-run))]
+    (println "S")
+    (doseq [[prefix key] [["I" :inputs]
+                          ["%I" :input-tags]
+                          ["O" :outputs]
+                          ["%O" :output-tags]]
+            target (step key)]
+      (println (str prefix \tab target)))))
 
 (defn run
   "Runs Drake with the specified parse-tree and an array of target
    selection expressions."
   [parse-tree targets]
-  (let [steps (parse-tree :steps)
-        target-steps (select-steps parse-tree targets)]
+  (let [target-steps (select-steps parse-tree targets)]
     (debug "selected (expanded) targets:" target-steps)
     (trace "--- Parse Tree: ---")
     (trace (with-out-str (clojure.pprint/pprint parse-tree)))
@@ -645,17 +634,10 @@
   []
   (when-let [java-cmd (-> (System/getProperties)
                           (get "sun.java.command"))]
-    (.endsWith java-cmd "nailgun.NGServer")))
+    (.endsWith ^String java-cmd "nailgun.NGServer")))
 
 (defn- shutdown [exit-code]
-  (when (not (true? (:repl *options*)))
-    (if (running-under-nailgun?)
-      (debug (str "core/shutdown: Running under Nailgun; "
-                  "not calling (shutdown-agents)"))
-      (do
-        (debug "core/shutdown: Running standalone; calling (shutdown-agents)")
-        (shutdown-agents)))
-    (System/exit exit-code)))
+  (throw+ {:exit-code exit-code}))
 
 (defn parse-cli-vars [vars-str split-regex-str]
   (when-not (empty? vars-str)
@@ -677,15 +659,17 @@
                           DEFAULT-VARS-SPLIT-REGEX-STR)]
     (merge
       (into {} (System/getenv))
-      (parse-cli-vars (*options* :vars) split-regex-str)
-      (when-let [base (*options* :base)]
+      (parse-cli-vars (:vars *options*) split-regex-str)
+      (into {} (for [v (:var *options*)]
+                 (str/split v #"=")))
+      (when-let [base (:base *options*)]
         {"BASE" base}))))
 
 (defn- with-workflow-file
   "Reads the workflow file from command-line options, parses it,
    and passes the parse tree to the provided function 'f'."
   [f]
-  (let [filename (*options* :workflow)
+  (let [filename (:workflow *options*)
         filename (if-not (fs/directory? filename)
                    filename
                    (let [workflow-file (str filename
@@ -721,31 +705,6 @@
                 parse-tree (assoc parse-tree :steps steps)]
             (f parse-tree)))))))
 
-(defn split-command-line
-  "Splits command-line options into two parts: options and targets.
-   The first word which does not start with '-' and not an option
-   parameter is considered the start of the list of targets.
-   Returns a tuple of vectors."
-  [args]
-  (let [non-flag-long #{"--workflow" "--branch" "--merge-branch"
-                        "--logfile" "--vars" "--base" "--plugins"
-                        "--aws-credentials" "--step-delay" "--jobs" "--tmpdir"
-                        "--split-vars-regex"}
-        non-flag-short #{\w \b \l \v \s \j}]
-    (loop [i 0]
-      (if (>= i (count args))
-        [args []]
-        (let [curarg (args i)]
-          (if (or (non-flag-long curarg)
-                  (and (>= (count curarg) 2)      ; starts with a single dash,
-                       (= (first curarg) \-)      ; last letter is in
-                       (not= (second curarg) \-)  ; non-flag-short
-                       (non-flag-short (last curarg))))
-              (recur (+ i 2))
-              (if (= \- (first (args i)))
-                (recur (inc i))
-                (split-at i args))))))))
-
 (defn configure-logging
   []
   (let [loglevel (cond
@@ -770,7 +729,7 @@
 (defn- confirm-move
   ;; TODO(artem) doc
   [outputs]
-  (if (*options* :auto)
+  (if (:auto *options*)
     true
     (do
       (println "The following directories will be moved:")
@@ -786,7 +745,8 @@
         ;; Collect selected steps' outputs, if they exist in the branch
         ;; We also need to normalize output filenames and add branch suffixes
         ;; to them
-        steps (map (parse-tree :steps) (map :index target-steps))
+        steps (map (comp (:steps parse-tree) :index)
+                   target-steps)
         all-outputs (mapcat :outputs steps)
         ;; vector of tuples [from, to]
         outputs-for-move (filter identity
@@ -835,113 +795,119 @@
                            (option-list (second used))))))
                 crossovers))))
 
-(defn -main
+(defn drake
   "Runs Drake's CLI.
 
    This can be called from the REPL for development purposes. You should include
-   the following options:
-     --repl (otherwise your REPL will likely be killed by Drake's exit)
+   the following option:
      --auto (otherwise the interactive user confirmation will hang on you)
    You don't need --auto if you use --preview.
 
    Examples:
-     (-main \"--repl\" \"--version\")
-     (-main \"--repl\" \"--preview\" \"-w\" \"demos/factual\" \"+...\")
-     (-main \"--repl\" \"--auto\" \"-w\"
+     (drake \"--version\")
+     (drake \"--preview\" \"-w\" \"demos/factual\" \"+...\")
+     (drake \"--auto\" \"-w\"
             \"some/workflow-file.drake\" drake \"+...\" \"-^D\" \"-=B\")
 
    TODO: log messages don't show up on the REPL (but printlns do).
          Can this be fixed?"
   [& args]
-  (let [[opts targets] (split-command-line (into [] args))
-        ;; We ignore 80 character limit here, since clojopts is a macro
+  (let [;; We ignore 80 character limit here, since clojopts is a macro
         ;; and calls to (str) do not work inside a clojopts call
         options (try
-                  (clojopts
-                   "drake"
-                   opts
-                   (with-arg workflow w
-                     "Name of the workflow file to execute; if a directory, look for Drakefile there."
-                     :type :str
-                     :user-name "file-or-dir-name")
-                   (with-arg jobs j
+                  (binding [clojopts/*stop-at-first-non-option* true]
+                    (clojopts
+                     "drake"
+                     args
+                     (with-arg workflow w
+                       "Name of the workflow file to execute; if a directory, look for Drakefile there."
+                       :type :str
+                       :user-name "file-or-dir-name")
+                     (with-arg jobs j
                        "Specifies the number of jobs (commands) to run simultaneously. Defaults to 1"
                        :type :int
                        :user-name "jobs-num")
-                   (no-arg auto a
-                     "Do not ask for user confirmation before running steps.")
-                   (no-arg preview P
-                           "Prints the steps that would run, then stops.")
-                   (with-arg base
-                     "Specifies BASE directory. Takes precedence over environment."
-                     :type :str
-                     :user-name "dir-name")
-                   (with-arg vars v
-                     "Add workflow variable definitions. For example -v X=1,Y=2,FILE=a.csv"
-                     :type :str
-                     :user-name "name-value-pairs")
-                   (with-arg branch b
-                     "Specifies a working branch (see spec for details)."
-                     :type :str
-                     :user-name "name")
-                   (with-arg merge-branch
-                     "Merges the specified targets (by default, all) of the given branch to the main branch. Data files are overwritten, backup files are merged (see spec for details)."
-                     :type :str
-                     :user-name "name")
-                   (no-arg print p
-                     "Runs Drake in \"print\" mode. Instead of executing steps, Drake just prints inputs, outputs and tags of each step that is scheduled to run to stdout. This is useful if some outside actions need to be taken before or after running Drake. Standard target matching rules apply. Inputs are prepended by I, outputs by O, and input and output tags by %I and %O respectively. It also outputs \"S\" to signify beginning of each step.")
-                   (with-arg logfile l
-                     "Specify the log file. If not absolute, will be relative to the workflow file, default is drake.log in the directory of the workflow file."
-                     :type :str
-                     :user-name "filename")
-                   (no-arg repl r
-                     "Supports REPL based running of Drake; foregoes JVM shutdown, et. al.")
-                   (with-arg step-delay
-                     "Specifies a period of time, in milliseconds, to wait after completion of each step. Some file systems have low timestamp resolution, and small steps can proceed so quickly that outputs of two or more steps can share the same timestamp, and will be re-built on a subsequent run of Drake. Also, if the clocks on HDFS and local filesystem are not perfectly synchronized, timestamped evaluation can break down. Specifying a delay can help in both cases."
-                     :type :int
-                     :user-name "ms")
-                   (with-arg plugins
-                     "Specifies a plugins configuration file. All dependencies listed in the file will be added to the classpath, and steps that call non-built-in protocols will look for protocol implementations in those dependencies."
-                     :type :file
-                     :user-name "filename")
-                   (with-arg aws-credentials s
-                     "Specifies a properties file containing aws credentials. The access_id should be in a property named 'access_key', while the secret part of the key should be in a property names 'secret_key'. Other values in the properties file are ignored."
-                     :type :str
-                     :user-name "properties-file")
-                   (no-arg quiet q
-                     "Suppress all Drake's output.")
-                   (no-arg debug
-                     "Turn on verbose debugging output.")
-                   (no-arg trace
-                     "Turn on even more verbose debugging output.")
-                   (no-arg version
-                     "Show version information.")
-                   (with-arg tmpdir
+                     (no-arg auto a
+                             "Do not ask for user confirmation before running steps.")
+                     (no-arg preview P
+                             "Prints the steps that would run, then stops.")
+                     (with-arg base
+                       "Specifies BASE directory. Takes precedence over environment."
+                       :type :str
+                       :user-name "dir-name")
+                     (with-arg vars v
+                       "Add workflow variable definitions. For example -v X=1,Y=2,FILE=a.csv"
+                       :type :str
+                       :user-name "name-value-pairs")
+                     (with-arg var
+                       "Set a workflow variable."
+                       :type :str
+                       :group :list
+                       :user-name "value")
+                     (with-arg branch b
+                       "Specifies a working branch (see spec for details)."
+                       :type :str
+                       :user-name "name")
+                     (with-arg merge-branch
+                       "Merges the specified targets (by default, all) of the given branch to the main branch. Data files are overwritten, backup files are merged (see spec for details)."
+                       :type :str
+                       :user-name "name")
+                     (no-arg print p
+                             "Runs Drake in \"print\" mode. Instead of executing steps, Drake just prints inputs, outputs and tags of each step that is scheduled to run to stdout. This is useful if some outside actions need to be taken before or after running Drake. Standard target matching rules apply. Inputs are prepended by I, outputs by O, and input and output tags by %I and %O respectively. It also outputs \"S\" to signify beginning of each step.")
+                     (with-arg logfile l
+                       "Specify the log file. If not absolute, will be relative to the workflow file, default is drake.log in the directory of the workflow file."
+                       :type :str
+                       :user-name "filename")
+                     (no-arg repl r
+                             "Supports REPL based running of Drake; foregoes JVM shutdown, et. al.")
+                     (with-arg step-delay
+                       "Specifies a period of time, in milliseconds, to wait after completion of each step. Some file systems have low timestamp resolution, and small steps can proceed so quickly that outputs of two or more steps can share the same timestamp, and will be re-built on a subsequent run of Drake. Also, if the clocks on HDFS and local filesystem are not perfectly synchronized, timestamped evaluation can break down. Specifying a delay can help in both cases."
+                       :type :int
+                       :user-name "ms")
+                     (with-arg plugins
+                       "Specifies a plugins configuration file. All dependencies listed in the file will be added to the classpath, and steps that call non-built-in protocols will look for protocol implementations in those dependencies."
+                       :type :file
+                       :user-name "filename")
+                     (with-arg aws-credentials s
+                       "Specifies a properties file containing aws credentials. The access_id should be in a property named 'access_key', while the secret part of the key should be in a property names 'secret_key'. Other values in the properties file are ignored."
+                       :type :str
+                       :user-name "properties-file")
+                     (no-arg quiet q
+                             "Suppress all Drake's output.")
+                     (no-arg debug
+                             "Turn on verbose debugging output.")
+                     (no-arg trace
+                             "Turn on even more verbose debugging output.")
+                     (no-arg version
+                             "Show version information.")
+                     (with-arg tmpdir
                        "Specifies the temporary directory for Drake files (by default, .drake/ in the same directory the main workflow file is located)."
                        :type :str
                        :user-name "tmpdir")
-                   (with-arg split-vars-regex
+                     (with-arg split-vars-regex
                        "Specifies a regex to split up the --vars argument (by default, a regex that splits on commas except commas within double quotes)."
                        :type :str
-                       :user-name "regex"))
+                       :user-name "regex")))
                   (catch IllegalArgumentException e
                     (println
-                      (str "\nUnrecognized option: "
-                           "did you mean target exclusion?\nto build "
-                           "everything except 'target'"
-                           " run:\n  drake ... -target"))
+                     (str "\nUnrecognized option: "
+                          "did you mean target exclusion?\nto build "
+                          "everything except 'target'"
+                          " run:\n  drake ... -target\n"
+                          "or:\n  drake -- -target"))
                     (shutdown -1)))
+        targets (:clojopts/more options)
         ;; if a flag is specified, clojopts adds the corresponding key
         ;; to the option map with nil value. here we convert them to true.
         ;; also, the defaults are specified here.
         options (into DEFAULT-OPTIONS
                       (for [[k v] options] [k (if (nil? v) true v)]))]
-    (flush)    ;; we need to do it for help to always print out
-    (let [targets (if (empty? targets) ["=..."] targets)]
-      (when (options :version)
+    (flush) ;; we need to do it for help to always print out
+    (let [targets (or (not-empty targets) ["=..."])]
+      (when (:version options)
         (println "Drake Version" VERSION "\n")
         (shutdown 0))
-      (when (some #{"--help"} opts)
+      (when (some #{"--help"} args)
         (shutdown 0))
 
       (check-for-conflicts options)
@@ -956,17 +922,31 @@
       (debug "parsed targets:" targets)
 
       (try+
-       (load-plugin-deps (*options* :plugins))
-       (let [fn (if (empty? (:merge-branch options)) run merge-branch)]
-         (with-workflow-file #(fn % targets)))
-       (shutdown 0)
-       (catch map? m
-         (error (str "drake: " (m :msg)))
-         (shutdown (or (get m :exit) 1)))
-       (catch Exception e
-         (.printStackTrace e)
-         (error (stack-trace-str e))
-         (shutdown 1))))))
+        (load-plugin-deps (:plugins *options*))
+        (let [fn (if (empty? (:merge-branch options)) run merge-branch)]
+          (with-workflow-file #(fn % targets)))
+        (shutdown 0)
+        (catch map? m
+          (error (str "drake: " (:msg m)))
+          (shutdown (get m :exit 1)))
+        (catch Exception e
+          (error (stack-trace-str e))
+          (shutdown 1))))))
+
+(defn -main
+  "Runs drake, and catches (shutdown) exceptions to cleanly shut down."
+  [& args]
+  (try+
+    (apply drake args)
+    (catch :exit-code {:keys [exit-code]}
+      (when (not (true? (:repl *options*)))
+        (if (running-under-nailgun?)
+          (debug (str "core/shutdown: Running under Nailgun; "
+                      "not calling (shutdown-agents)"))
+          (do
+            (debug "core/shutdown: Running standalone; calling (shutdown-agents)")
+            (shutdown-agents)))
+        (System/exit exit-code)))))
 
 (defn run-opts [opts]
   (let [opts (merge {:auto true} opts)]
@@ -978,7 +958,7 @@
     (info "Clojure version:" *clojure-version*)
     (info "Options:" opts)
 
-    (load-plugin-deps (*options* :plugins))
+    (load-plugin-deps (:plugins *options*))
     (with-workflow-file #(run % (:targetv opts)))))
 
 (defn -run_opts

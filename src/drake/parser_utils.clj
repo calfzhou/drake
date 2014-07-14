@@ -1,5 +1,6 @@
 (ns drake.parser_utils
   (:require [name.choi.joshua.fnparse :as p]
+            [flatland.useful.datatypes :refer [assoc-record]]
             [clojure.tools.logging :refer [warn debug trace]])
   (:use [slingshot.slingshot :only [throw+]]))
 
@@ -8,8 +9,20 @@
 ;; respective fields. :vars is a map of additional key/value pairs that
 ;; can help keep state. As FnParse applies rules to this state and consumes
 ;; tokens, the state gets modified accordingly.
-(defstruct state-s :remainder :vars :methods :column :line)
+;;
+;; This is a record for performance reasons: this map gets updated very often,
+;; and copying the array-map is otherwise needlessly expensive
 
+(defrecord State [remainder vars methods column line])
+
+(defn make-state [remainder vars methods column line]
+  (->State remainder vars methods column line))
+
+(defn remainder-accessor [^State s]
+  (.remainder s))
+
+(defn remainder-setter [^State s new-remainder]
+  (assoc-record s :remainder new-remainder))
 
 ;; rep+ and rep* return a vector of the products of the rules being repeated.
 ;; Even if a rule's product is nil, the nil would show up in the vector.
@@ -46,7 +59,7 @@
 ;; parse errors
 
 (defn throw-parse-error [state message message-args]
-  (throw+ {:msg 
+  (throw+ {:msg
            (str (if (:file-path state) (str "In " (:file-path state) ", ") "")
                 (format "parse error at line %s, column %s: "
                         (:line state) (:column state))
@@ -157,8 +170,20 @@
                                               double-quote
                                               backslash
                                               line-break)))
-(def non-double-quote-or-backslash (p/except p/anything 
+(def non-double-quote-or-backslash (p/except p/anything
                                              (p/alt double-quote backslash)))
+
+(defn delimited [delim body]
+  (p/conc delim body delim))
+
+(defn ignore-delimiter [parser]
+  (p/semantics parser #(apply str (second %))))
+
+(defn include-delimiter [parser]
+  (p/semantics parser #(apply str `(~(first %) ~@(second %) ~(last %)))))
+
+(def single-quote-shell-string
+  (include-delimiter (delimited single-quote (p/rep* non-single-quote))))
 
 (def fractional-part (p/conc decimal-point (p/rep* decimal-digit)))
 
@@ -168,12 +193,6 @@
           (expectation-error-fn
             (str "in number literal, after an exponent sign, decimal"
                  "digit")))))
-
-(def single-quote-shell-string
-  (p/semantics (p/conc single-quote
-                       (p/rep* non-single-quote)
-                       single-quote)
-               flatten-apply-str))
 
 (def number-lit
   (p/complex [minus (p/opt minus-sign)
@@ -201,7 +220,7 @@
     (-> digits apply-str (Integer/parseInt 16) char)))
 (def escaped-characters
   {\\ \\, \/ \/, \b \backspace, \f \formfeed, \n \newline, \r \return,
-   \t \tab, \" \", \$ \$, \) \)})
+   \t \tab, \" \", \' \', \$ \$, \) \)})
 
 (def normal-escape-sequence
   (p/semantics (p/lit-alt-seq (keys escaped-characters) nb-char-lit)
@@ -215,3 +234,9 @@
 
 (def string-char
   (p/alt escape-sequence unescaped-char))
+
+(def strong-quote
+  (p/complex [_ single-quote
+              chars (p/rep* (p/except p/anything single-quote))
+              _ single-quote]
+             (apply str chars)))

@@ -12,25 +12,13 @@
 (defn clip
   "Returns string s without its first character."
   [s]
-  (.substring s 1))
+  (subs s 1))
 
-(defn delete [vc pos]
-  "Removes an element from vector by index in the most effecient way.
-   Doesn't do anything if pos == -1."
-  (if (= pos -1)
-    vc
-    (vec (concat
-          (subvec vc 0 pos)
-          (subvec vc (inc pos))))))
-
-(defn insert [vc pos value]
-  "Inserts an element into the vector into the specified position
-   in the most effecient way."
-  (into (conj (subvec vc 0 pos) value)
-        (subvec vc pos (count vc))))
-
-(defn inc-if [cond value]
-  (if cond (inc value) value))
+(defn ensure-final-newline
+  [^String s]
+  (if (.endsWith s "\n")
+    s
+    (str s "\n")))
 
 (defn concat-distinct
   "Concatinates given sequences, removing all duplicates but
@@ -47,10 +35,10 @@
    preserves the key order (e.g. :key1 will always be before :key2 in the
    value vectors from the example above)."
   [m]
-  (reduce
-   (fn [result [key values]]
-     (reduce #(assoc %1 %2 (conj (%1 %2 []) key)) result values))
-   {} m))
+  (apply merge-with into {}
+         (for [[key values] m
+               value values]
+           {value [key]})))
 
 (defn merge-multimaps-distinct
   "Given a list of maps to sequences, merges them into one,
@@ -96,5 +84,5 @@
 
 (defn relative-path
   [file]
-  (.substring (.getAbsolutePath (fs/file file))
-              (inc (count (.getAbsolutePath fs/*cwd*)))))
+  (subs (.getAbsolutePath (fs/file file))
+        (inc (count (.getAbsolutePath (fs/file fs/*cwd*))))))

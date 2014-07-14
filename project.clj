@@ -1,14 +1,19 @@
-(defproject factual/drake "0.1.5"
+(defproject factual/drake "0.1.6"
   :description "Drake: the data processing workflow tool (a.k.a. 'make for data')"
   :url "https://github.com/Factual/drake"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.4.0"]
+  :scm {:name "git"
+        :url "https://github.com/Factual/drake"}
+  :signing {:gpg-key "1402451C"}
+  :deploy-repositories [["clojars" {:creds :gpg}]]
+  :dependencies [[org.clojure/clojure "1.6.0"]
                  [org.clojure/core.memoize "0.5.6"]
                  [factual/drake-interface "0.0.1"]
                  [org.clojure/tools.logging "0.2.3"]
                  [clj-logging-config "1.9.6"]
-                 [clojopts/clojopts "0.3.2"]
+                 [clojopts/clojopts "0.3.4"]
+                 [org.flatland/useful "0.11.1"]
                  [fs "1.3.2"]
                  [factual/jlk-time "0.1"]
                  [clj-time "0.6.0"]
