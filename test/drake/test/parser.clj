@@ -1,10 +1,12 @@
 (ns drake.test.parser
   (:use [clojure.tools.logging :only [warn debug trace]]
         clojure.test)
-  (:require [drake.parser :as d]))
+  (:require [drake.parser :as d]
+            [drake.parser_utils :as p])
+  (:import java.io.File))
 
-(defstruct state-s :vars :methods :line :column :remainder)
-(def make-state (partial struct state-s {"BASE" "/base"} #{} 0 0))
+(defn make-state [remainder]
+  (p/make-state remainder {"BASE" "/base"} #{} 0 0))
 
 (defn prod-eq?
   [actual-tuple expected-product]
@@ -38,6 +40,18 @@
   (is (var-eq? (d/var-def-line
                 (make-state "MYVAR=$(echo \"foo bar\" | sed s/o/u/g)\n"))
                "MYVAR" "fuu bar")))
+
+(deftest ignored-shell-commands-not-run
+  (let [f (doto (File/createTempFile "drake-test" nil)
+            (.delete))
+        filename (.getPath f)]
+    (is (var-eq? (d/var-def-line (-> (format "CREATE:=$(echo 5 | tee %s)\n" filename)
+                                     (make-state)
+                                     (assoc :vars {"CREATE" "already-set"})))
+                 "CREATE" "already-set"))
+    (is (not (.exists f)))
+    (when (.exists f)
+      (.delete f))))
 
 (deftest options-test
   (is (prod-eq? (d/options (make-state "[shell]")) {:protocol "shell"}))
