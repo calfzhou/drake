@@ -102,7 +102,7 @@
 ;; escaped.
 ;; 3. Maybe allow using string literals for filenames as well ("filename")?
 (def filename-chars
-  (p/alt alphanumeric underscore hyphen period colon forward-slash equal-sign))
+  (p/alt alphanumeric underscore hyphen period colon forward-slash))
 
 (def inline-comment
   (p/conc semicolon (p/rep* non-line-break)))
@@ -561,13 +561,13 @@
   (p/complex
    [body (semantic-rm-nil
           (p/rep* (p/alt inline-shell-cmd-line
+                         step-lines
                          method-lines
                          call-or-include-line
                          (nil-semantics (p/conc (p/opt inline-ws) line-break))
                                         ;; any ws ending with line-break
                          (nil-semantics (p/conc inline-comment line-break))
-                         (nil-semantics var-def-line)
-                         step-lines)))
+                         (nil-semantics var-def-line))))
     vars (p/get-info :vars)]
    (assoc (deep-merge (concat [{:vars {} :methods {}}] body))
      :vars vars)))
