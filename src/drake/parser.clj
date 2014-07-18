@@ -132,16 +132,14 @@
               var-name (p/semantics (p/rep+ var-name-chars) apply-str)
               _ (p/failpoint close-bracket
                              (illegal-syntax-error-fn "variable"))
-              vars (p/get-info :vars)
-              inputs (p/get-info :inputs)
+              {:keys [vars inputs] :as state} p/get-state
               ]
              ;; even though we don't always make substitutions here,
              ;; we still check if the variable is defined
              ;; (unless it's a method in which case
              ;; we just don't know what variables will be available)
              (if (and var-check (not (contains? vars var-name)))
-               (throw+ {:msg (format "variable \"%s\" undefined at this point."
-                                     var-name)})
+               (throw-parse-error state "variable \"%s\" undefined at this point." var-name)
                (if-not substitute-value
                  #{var-name}
                  (get vars var-name)))))
@@ -262,9 +260,9 @@
                          vals
                          (throw-parse-error
                           p/get-state
-                          (format "option \"%s\" cannot have multiple values."
-                                  (name key))
-                          nil)))]) val-vectors))))
+                          "option \"%s\" cannot have multiple values."
+                          (name key))))])
+                  val-vectors))))
 
 (def options
   "input: options for a step definition. ie., [shell +hadoop my_var:my_value]
@@ -471,26 +469,23 @@
          {:keys [method method-mode template]} (:opts step-def-product)]
      (cond
       (not (or (empty? method) (methods method)))
-      (throw-parse-error state (format "method '%s' undefined at this point."
-                                       method)
-                         nil)
+      (throw-parse-error state "method '%s' undefined at this point."
+                         method)
 
       (not (or (empty? method-mode) (#{"use" "append" "replace"} method-mode)))
       (throw-parse-error state (str "invalid method-mode, valid values are: "
-                                    "use (default), append, and replace.")
-                         nil)
+                                    "use (default), append, and replace."))
 
       (not (or method (empty? method-mode)))
       (throw-parse-error state
-                         "method-mode specified but method name not given"
-                         nil)
+                         "method-mode specified but method name not given")
 
       (and method (not (#{"append" "replace"} method-mode))
            (not (empty? commands)))
       (throw-parse-error state
                          (str "commands not allowed for method calls "
                               "(use method-mode:append or method-mode:replace "
-                              "to allow)") nil)
+                              "to allow)"))
 
       template
       {:templates [step-prod]}
@@ -538,8 +533,10 @@
   (p/complex
    [vars (p/get-info :vars)
     var-name (p/rep+ var-name-chars)
+    _ (p/opt inline-ws)
     has-colon (p/opt colon)
     _ equal-sign
+    _ (p/opt inline-ws)
     :let [use-value (or (not has-colon) (empty? (get vars (apply-str var-name))))]
     _ (p/update-info :value-ignored (constantly (not use-value)))
     var-value (p/alt (string-substitution var-value-chars) string-lit)
